@@ -42,9 +42,9 @@ small{color:#8192a8;text-align:center;margin-top:15px}
 <small>Protótipo inicial da NEXUS AI</small>
 </main>
 <script>
-const form=document.getElementById('form');
-const input=document.getElementById('input');
-const chat=document.getElementById('chat');
+const form = document.getElementById('form');
+const input = document.getElementById('input');
+const chat = document.getElementById('chat');
 
 form.addEventListener('submit', async e => {
   e.preventDefault();
@@ -55,7 +55,8 @@ form.addEventListener('submit', async e => {
   addMessage(message, 'user');
   input.value = '';
 
-  const pending = addMessage('NEXUS AI está pensando...', 'ai');
+  const pending = addMessage('', 'ai');
+  pending.textContent = 'NEXUS AI está pensando...';
 
   try {
     const response = await fetch(
@@ -69,20 +70,72 @@ form.addEventListener('submit', async e => {
       }
     );
 
-    const data = await response.json();
-    pending.textContent = data.reply || data.error || 'Não consegui responder.';
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Erro no servidor.');
+    }
+
+    if (!response.body) {
+      throw new Error('O servidor não enviou uma resposta.');
+    }
+
+    pending.textContent = '';
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || '';
+
+      for (const event of events) {
+        const lines = event.split(/\r?\n/);
+
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+
+          const raw = line.slice(5).trim();
+          if (!raw || raw === '[DONE]') continue;
+
+          try {
+            const data = JSON.parse(raw);
+            const parts = data.candidates?.[0]?.content?.parts || [];
+
+            for (const part of parts) {
+              if (part.text) {
+                pending.textContent += part.text;
+                chat.scrollTop = chat.scrollHeight;
+              }
+            }
+          } catch (error) {
+            console.log('Trecho recebido:', raw);
+          }
+        }
+      }
+    }
+
+    if (!pending.textContent) {
+      pending.textContent = 'A NEXUS não recebeu texto da IA.';
+    }
+
   } catch (error) {
-    pending.textContent = 'Erro de conexão com o servidor. Tente novamente.';
+    pending.textContent = 'Erro: ' + error.message;
   }
 });
 
-function addMessage(text,type){
- const div=document.createElement('div');
- div.className='message '+type;
- div.textContent=text;
- chat.appendChild(div);
- chat.scrollTop=chat.scrollHeight;
-return div;
+function addMessage(text, type) {
+  const div = document.createElement('div');
+  div.className = 'message ' + type;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
 }
 </script>
 </body>
