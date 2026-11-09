@@ -23,6 +23,7 @@ header p{color:#9caec5}
 form{display:flex;gap:10px;margin-top:15px}
 input{flex:1;min-width:0;padding:16px;border-radius:12px;border:1px solid #33445e;background:#111c2d;color:white}
 button{padding:14px 22px;border:0;border-radius:12px;background:#168bd1;color:white;font-weight:bold;cursor:pointer}
+button:disabled{opacity:.5;cursor:wait}
 small{color:#8192a8;text-align:center;margin-top:15px}
 </style>
 </head>
@@ -54,11 +55,13 @@ const sendButton = document.getElementById('sendButton');
 const API_URL =
 'https://nexus-ai6124.anonimosf4t4l.workers.dev/';
 
-// Cria uma identidade anônima persistente para este navegador.
+// Identidade anônima persistente do navegador.
 function getSessionId() {
   let id = localStorage.getItem('nexus_session_id');
 
-  if (!id) {
+  const valid = /^[a-zA-Z0-9_-]{20,100}$/;
+
+  if (!id || !valid.test(id)) {
     id = crypto.randomUUID();
     localStorage.setItem('nexus_session_id', id);
   }
