@@ -32,19 +32,41 @@ small{color:#8192a8;text-align:center;margin-top:15px}
 <h1>NEXUS AI</h1>
 <p>Inteligência • Memória • Autonomia</p>
 </header>
+
 <section id="chat" aria-live="polite">
 <div class="message ai">Olá! Eu sou a NEXUS. Estou pronta para começar nossa jornada de aprendizado.</div>
 </section>
+
 <form id="form">
 <input id="input" placeholder="Converse com a NEXUS..." autocomplete="off" required>
-<button>Enviar</button>
+<button id="sendButton">Enviar</button>
 </form>
+
 <small>Protótipo inicial da NEXUS AI</small>
 </main>
+
 <script>
 const form = document.getElementById('form');
 const input = document.getElementById('input');
 const chat = document.getElementById('chat');
+const sendButton = document.getElementById('sendButton');
+
+const API_URL =
+'https://nexus-ai6124.anonimosf4t4l.workers.dev/';
+
+// Cria uma identidade anônima persistente para este navegador.
+function getSessionId() {
+  let id = localStorage.getItem('nexus_session_id');
+
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem('nexus_session_id', id);
+  }
+
+  return id;
+}
+
+const sessionId = getSessionId();
 
 form.addEventListener('submit', async e => {
   e.preventDefault();
@@ -54,21 +76,22 @@ form.addEventListener('submit', async e => {
 
   addMessage(message, 'user');
   input.value = '';
+  sendButton.disabled = true;
 
   const pending = addMessage('', 'ai');
   pending.textContent = 'NEXUS AI está pensando...';
 
   try {
-    const response = await fetch(
-      'https://nexus-ai6124.anonimosf4t4l.workers.dev/',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ message })
-      }
-    );
+    const response = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: message,
+        sessionId: sessionId
+      })
+    });
 
     if (!response.ok) {
       const error = await response.json();
@@ -126,6 +149,9 @@ form.addEventListener('submit', async e => {
 
   } catch (error) {
     pending.textContent = 'Erro: ' + error.message;
+  } finally {
+    sendButton.disabled = false;
+    input.focus();
   }
 });
 
