@@ -1,171 +1,730 @@
 
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NEXUS AI</title>
-<style>
-*{box-sizing:border-box}
-body{
- margin:0;background:#090d18;color:#fff;
- font-family:Arial,sans-serif;display:flex;
- justify-content:center;min-height:100vh;
+const MODEL = "gemini-3.1-flash-lite";
+const SITE_ORIGIN = "https://anonimos670.github.io";
+
+// CORS
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": SITE_ORIGIN,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  };
 }
-main{width:100%;max-width:850px;padding:25px;display:flex;flex-direction:column}
-header{text-align:center;padding:25px}
-h1{font-size:38px;color:#65caff;letter-spacing:4px}
-header p{color:#9caec5}
-#chat{flex:1;min-height:350px;max-height:65vh;overflow-y:auto;padding:15px}
-.message{padding:14px 17px;border-radius:14px;margin:12px 0;line-height:1.5;white-space:pre-wrap}
-.user{background:#174b75;margin-left:15%;text-align:right}
-.ai{background:#172337;margin-right:15%}
-form{display:flex;gap:10px;margin-top:15px}
-input{flex:1;min-width:0;padding:16px;border-radius:12px;border:1px solid #33445e;background:#111c2d;color:white}
-button{padding:14px 22px;border:0;border-radius:12px;background:#168bd1;color:white;font-weight:bold;cursor:pointer}
-button:disabled{opacity:.5;cursor:wait}
-small{color:#8192a8;text-align:center;margin-top:15px}
-</style>
-</head>
-<body>
-<main>
-<header>
-<h1>NEXUS AI</h1>
-<p>Inteligência • Memória • Autonomia</p>
-</header>
 
-<section id="chat" aria-live="polite">
-<div class="message ai">Olá! Eu sou a NEXUS. Estou pronta para começar nossa jornada de aprendizado.</div>
-</section>
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/json"
+    }
+  });
+}
 
-<form id="form">
-<input id="input" placeholder="Converse com a NEXUS..." autocomplete="off" required>
-<button id="sendButton">Enviar</button>
-</form>
+// GEMINI
+async function callGemini(env, body, streaming = false) {
+  const endpoint = streaming
+    ? `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`
+    : `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
-<small>Protótipo inicial da NEXUS AI</small>
-</main>
+  const options = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY
+    },
+    body: JSON.stringify(body)
+  };
 
-<script>
-const form = document.getElementById('form');
-const input = document.getElementById('input');
-const chat = document.getElementById('chat');
-const sendButton = document.getElementById('sendButton');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await fetch(endpoint, options);
 
-const API_URL =
-'https://nexus-ai6124.anonimosf4t4l.workers.dev/';
+    if (response.status !== 503 || attempt === 2) {
+      return response;
+    }
 
-// Identidade anônima persistente do navegador.
-function getSessionId() {
-  let id = localStorage.getItem('nexus_session_id');
+    await new Promise(resolve =>
+      setTimeout(resolve, 1000 * (attempt + 1))
+    );
+  }
+}
 
-  const valid = /^[a-zA-Z0-9_-]{20,100}$/;
+// EXTRAIR TEXTO
+function extractText(data) {
+  return data?.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || "")
+    .join("") || "";
+}
 
-  if (!id || !valid.test(id)) {
-    id = crypto.randomUUID();
-    localStorage.setItem('nexus_session_id', id);
+function extractStreamText(raw) {
+  const texts = [];
+
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+
+    const value = line.slice(5).trim();
+
+    if (!value || value === "[DONE]") continue;
+
+    try {
+      const data = JSON.parse(value);
+      const text = extractText(data);
+
+      if (text) texts.push(text);
+    } catch {}
   }
 
-  return id;
+  return texts.join("");
 }
 
-const sessionId = getSessionId();
+// PALAVRAS-CHAVE
+function getKeywords(message) {
+  const ignored = new Set([
+    "para", "como", "sobre", "quais", "qual",
+    "quando", "onde", "porque", "isso", "essa",
+    "este", "mais", "muito", "fazer", "quero",
+    "voce", "tambem", "pode", "preciso", "pesquisar"
+  ]);
 
-form.addEventListener('submit', async e => {
-  e.preventDefault();
+  const words = message
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .match(/[a-z0-9]{4,}/g) || [];
 
-  const message = input.value.trim();
-  if (!message) return;
+  return [...new Set(words)]
+    .filter(word => !ignored.has(word))
+    .slice(0, 5);
+}
 
-  addMessage(message, 'user');
-  input.value = '';
-  sendButton.disabled = true;
+// PESQUISA NA WIKIPÉDIA
+async function researchWikipedia(topic) {
+  const searchUrl = new URL("https://pt.wikipedia.org/w/api.php");
 
-  const pending = addMessage('', 'ai');
-  pending.textContent = 'NEXUS AI está pensando...';
+  searchUrl.search = new URLSearchParams({
+    action: "query",
+    list: "search",
+    srsearch: topic,
+    srlimit: "3",
+    format: "json",
+    utf8: "1"
+  });
+
+  const searchResponse = await fetch(searchUrl);
+
+  if (!searchResponse.ok) {
+    throw new Error("Não foi possível pesquisar na Wikipédia.");
+  }
+
+  const searchData = await searchResponse.json();
+  const pages = searchData.query?.search || [];
+
+  if (!pages.length) return [];
+
+  const detailsUrl = new URL("https://pt.wikipedia.org/w/api.php");
+
+  detailsUrl.search = new URLSearchParams({
+    action: "query",
+    pageids: pages.map(page => page.pageid).join("|"),
+    prop: "extracts|info",
+    exintro: "1",
+    explaintext: "1",
+    inprop: "url",
+    format: "json",
+    formatversion: "2"
+  });
+
+  const detailsResponse = await fetch(detailsUrl);
+
+  if (!detailsResponse.ok) {
+    throw new Error("Não foi possível obter os artigos.");
+  }
+
+  const detailsData = await detailsResponse.json();
+
+  return (detailsData.query?.pages || [])
+    .filter(page => page.extract)
+    .map(page => ({
+      id: crypto.randomUUID(),
+      title: page.title,
+      content: page.extract.slice(0, 10000),
+      category: "research",
+      source: page.fullurl ||
+        `https://pt.wikipedia.org/?curid=${page.pageid}`
+    }));
+}
+
+// SALVAR CONHECIMENTO
+async function saveKnowledge(env, articles) {
+  if (!articles.length) return;
+
+  const statements = articles.map(article =>
+    env.DB.prepare(`
+      INSERT OR IGNORE INTO knowledge
+      (id, title, content, category, source)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(
+      article.id,
+      article.title,
+      article.content,
+      article.category,
+      article.source
+    )
+  );
+
+  await env.DB.batch(statements);
+}
+
+// BUSCAR CONHECIMENTO
+async function getKnowledge(env, message) {
+  const keywords = getKeywords(message);
+
+  if (!keywords.length) return [];
+
+  const conditions = keywords
+    .map(() => "(title LIKE ? OR content LIKE ?)")
+    .join(" OR ");
+
+  const bindings = [];
+
+  for (const word of keywords) {
+    bindings.push(`%${word}%`, `%${word}%`);
+  }
+
+  const result = await env.DB.prepare(`
+    SELECT title, content, source, category
+    FROM knowledge
+    WHERE ${conditions}
+    ORDER BY created_at DESC
+    LIMIT 5
+  `).bind(...bindings).all();
+
+  return result.results || [];
+}
+
+// MEMÓRIA
+async function getMemories(env, sessionId) {
+  const result = await env.DB.prepare(`
+    SELECT content, category
+    FROM memories
+    WHERE user_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT 12
+  `).bind(sessionId).all();
+
+  return (result.results || []).reverse().map(item => ({
+    role: item.category === "assistant" ? "model" : "user",
+    parts: [{ text: item.content }]
+  }));
+}
+
+async function saveConversation(env, sessionId, userMessage, answer) {
+  await env.DB.batch([
+    env.DB.prepare(`
+      INSERT INTO memories (id, user_id, content, category)
+      VALUES (?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      sessionId,
+      userMessage,
+      "user"
+    ),
+
+    env.DB.prepare(`
+      INSERT INTO memories (id, user_id, content, category)
+      VALUES (?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      sessionId,
+      answer,
+      "assistant"
+    )
+  ]);
+}
+
+// CORREÇÕES
+async function saveCorrection(env, sessionId, topic, correction) {
+  await env.DB.prepare(`
+    INSERT INTO corrections
+    (id, user_id, topic, wrong_answer, correction)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(
+    crypto.randomUUID(),
+    sessionId,
+    topic,
+    null,
+    correction
+  ).run();
+}
+
+async function getCorrections(env, sessionId, message) {
+  const keywords = getKeywords(message);
+
+  if (!keywords.length) return [];
+
+  const conditions = keywords
+    .map(() => "(topic LIKE ? OR correction LIKE ?)")
+    .join(" OR ");
+
+  const bindings = [sessionId];
+
+  for (const word of keywords) {
+    bindings.push(`%${word}%`, `%${word}%`);
+  }
+
+  const result = await env.DB.prepare(`
+    SELECT topic, correction, created_at
+    FROM corrections
+    WHERE user_id = ?
+    AND (${conditions})
+    ORDER BY created_at DESC
+    LIMIT 5
+  `).bind(...bindings).all();
+
+  return result.results || [];
+}
+
+// AUTOAVALIAÇÃO
+async function reviewAnswer(
+  env,
+  question,
+  answer,
+  knowledgeContext,
+  correctionContext
+) {
+  const response = await callGemini(env, {
+    systemInstruction: {
+      parts: [{
+        text: `Você é o avaliador de qualidade da NEXUS AI.
+
+Analise a pergunta e a resposta procurando erros factuais concretos,
+contradições ou informações possivelmente incorretas.
+
+Não sinalize opiniões, estilo ou pequenas omissões.
+Se houver dúvida, não sinalize.
+
+Responda SOMENTE em JSON válido:
+
+{"issue":false}
+
+ou
+
+{"issue":true,"topic":"assunto","reason":"explicação curta"}`
+      }]
+    },
+    contents: [{
+      role: "user",
+      parts: [{
+        text: `PERGUNTA:
+${question}
+
+RESPOSTA:
+${answer}
+
+CONHECIMENTOS:
+${knowledgeContext}
+
+CORREÇÕES:
+${correctionContext}`
+      }]
+    }],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 300,
+      responseMimeType: "application/json"
+    }
+  });
+
+  if (!response.ok) return null;
 
   try {
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        message: message,
-        sessionId: sessionId
-      })
+    const data = await response.json();
+    const result = JSON.parse(extractText(data));
+
+    if (
+      result.issue !== true ||
+      !result.topic ||
+      !result.reason
+    ) return null;
+
+    return {
+      topic: String(result.topic).slice(0, 200),
+      reason: String(result.reason).slice(0, 1500)
+    };
+  } catch {
+    return null;
+  }
+}
+
+// SALVAR REVISÃO
+async function savePendingReview(
+  env,
+  sessionId,
+  topic,
+  answer,
+  reason
+) {
+  await env.DB.prepare(`
+    INSERT INTO pending_reviews
+    (id, user_id, topic, answer, reason)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(
+    crypto.randomUUID(),
+    sessionId,
+    topic,
+    answer,
+    reason
+  ).run();
+}
+
+// TAREFAS EM SEGUNDO PLANO
+async function processAfterResponse(
+  env,
+  sessionId,
+  message,
+  rawResponse,
+  knowledgeContext,
+  correctionContext,
+  correctionCommand
+) {
+  const answer = extractStreamText(rawResponse);
+
+  if (!answer) return;
+
+  await saveConversation(env, sessionId, message, answer);
+
+  if (answer.length < 100 || correctionCommand) return;
+
+  try {
+    const review = await reviewAnswer(
+      env,
+      message,
+      answer,
+      knowledgeContext,
+      correctionContext
+    );
+
+    if (review) {
+      await savePendingReview(
+        env,
+        sessionId,
+        review.topic,
+        answer,
+        review.reason
+      );
+    }
+  } catch (error) {
+    console.error("Erro na autoavaliação:", error);
+  }
+}
+
+// PROCESSAMENTO PRINCIPAL
+async function handleChat(request, env, ctx) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      headers: corsHeaders()
     });
+  }
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || 'Erro no servidor.');
+  if (request.method !== "POST") {
+    return jsonResponse({
+      error: "Método não permitido."
+    }, 405);
+  }
+
+  if (!env.GEMINI_API_KEY || !env.DB) {
+    return jsonResponse({
+      error: "Configure GEMINI_API_KEY e o binding DB."
+    }, 500);
+  }
+
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({
+      error: "JSON inválido."
+    }, 400);
+  }
+
+  const message = String(body.message || "").trim();
+  const sessionId = String(body.sessionId || "");
+
+  if (!message) {
+    return jsonResponse({
+      error: "Mensagem vazia."
+    }, 400);
+  }
+
+  if (!/^[a-zA-Z0-9_-]{20,100}$/.test(sessionId)) {
+    return jsonResponse({
+      error: "Identificador de sessão inválido."
+    }, 400);
+  }
+
+  try {
+    const history = await getMemories(env, sessionId);
+
+    const explicitResearch = message.match(/^\/pesquisar\s+(.+)/i);
+
+    const correctionCommand = message.match(
+      /^\/corrigir\s+([^|]+)\|\s*([\s\S]+)$/i
+    );
+
+    if (
+      message.toLowerCase().startsWith("/corrigir") &&
+      !correctionCommand
+    ) {
+      return jsonResponse({
+        error: "Use: /corrigir assunto | correção correta"
+      }, 400);
     }
 
-    if (!response.body) {
-      throw new Error('O servidor não enviou uma resposta.');
+    let researchTopic = explicitResearch
+      ? explicitResearch[1].trim()
+      : null;
+
+    let researchError = null;
+    let researchedArticles = [];
+
+    let correctionTopic = null;
+    let correctionText = null;
+
+    if (correctionCommand) {
+      correctionTopic = correctionCommand[1].trim();
+      correctionText = correctionCommand[2].trim();
+
+      await saveCorrection(
+        env,
+        sessionId,
+        correctionTopic,
+        correctionText
+      );
     }
 
-    pending.textContent = '';
+    let knowledge = await getKnowledge(env, message);
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    let corrections = await getCorrections(
+      env,
+      sessionId,
+      message
+    );
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
+    // PESQUISA EXPLÍCITA
+    if (researchTopic) {
+      try {
+        researchedArticles = await researchWikipedia(researchTopic);
 
-      buffer += decoder.decode(value, { stream: true });
+        await saveKnowledge(env, researchedArticles);
 
-      const events = buffer.split(/\r?\n\r?\n/);
-      buffer = events.pop() || '';
-
-      for (const event of events) {
-        const lines = event.split(/\r?\n/);
-
-        for (const line of lines) {
-          if (!line.startsWith('data:')) continue;
-
-          const raw = line.slice(5).trim();
-          if (!raw || raw === '[DONE]') continue;
-
-          try {
-            const data = JSON.parse(raw);
-            const parts = data.candidates?.[0]?.content?.parts || [];
-
-            for (const part of parts) {
-              if (part.text) {
-                pending.textContent += part.text;
-                chat.scrollTop = chat.scrollHeight;
-              }
-            }
-          } catch (error) {
-            console.log('Trecho recebido:', raw);
-          }
-        }
+        knowledge = await getKnowledge(env, researchTopic);
+      } catch (error) {
+        researchError = error.message || "Pesquisa indisponível.";
       }
     }
 
-    if (!pending.textContent) {
-      pending.textContent = 'A NEXUS não recebeu texto da IA.';
+    if (correctionCommand) {
+      corrections = await getCorrections(
+        env,
+        sessionId,
+        correctionTopic
+      );
     }
 
-  } catch (error) {
-    pending.textContent = 'Erro: ' + error.message;
-  } finally {
-    sendButton.disabled = false;
-    input.focus();
-  }
-});
+    const knowledgeContext = knowledge.length
+      ? knowledge.map(item => `
+Título: ${item.title}
+Conteúdo: ${item.content}
+Fonte: ${item.source}
+`).join("\n")
+      : "Nenhum conhecimento armazenado relacionado.";
 
-function addMessage(text, type) {
-  const div = document.createElement('div');
-  div.className = 'message ' + type;
-  div.textContent = text;
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
-  return div;
+    const correctionContext = corrections.length
+      ? corrections.map(item => `
+Assunto: ${item.topic}
+Correção registrada pelo usuário: ${item.correction}
+`).join("\n")
+      : "Nenhuma correção relacionada encontrada.";
+
+    const researchStatus = researchTopic
+      ? researchedArticles.length
+        ? `Pesquisa realizada sobre "${researchTopic}".`
+        : researchError
+          ? `A pesquisa não pôde ser concluída: ${researchError}`
+          : `Nenhum artigo encontrado sobre "${researchTopic}".`
+      : "Nenhuma pesquisa externa realizada nesta mensagem.";
+
+    const systemInstruction = `
+Você é a NEXUS AI, uma inteligência artificial assistente.
+
+IDENTIDADE:
+- Seu nome é NEXUS.
+- Converse em português do Brasil.
+- Seja clara, inteligente, natural e prestativa.
+- Nunca invente informações.
+
+MEMÓRIA:
+Utilize o histórico de conversas fornecido.
+Considere os conhecimentos armazenados.
+
+CORREÇÕES:
+As correções abaixo foram registradas pelo usuário.
+Considere-as quando forem relevantes.
+Não ignore uma correção relacionada ao assunto.
+Se uma correção contradisser uma fonte confiável,
+explique a divergência.
+
+CORREÇÕES DISPONÍVEIS:
+${correctionContext}
+
+CONHECIMENTOS PESQUISADOS:
+${knowledgeContext}
+
+PESQUISA:
+${researchStatus}
+
+APRENDIZADO:
+Você utiliza memória, pesquisas e correções para melhorar
+suas respostas futuras. Isso não altera os parâmetros internos
+nem o treinamento original do modelo.
+
+FONTES:
+Quando utilizar informações pesquisadas, apresente os links
+das fontes disponíveis. Nunca diga que pesquisou se não pesquisou.
+`;
+
+    let finalMessage = message;
+
+    if (correctionCommand) {
+      finalMessage = `
+O usuário acabou de registrar uma correção.
+
+Assunto: ${correctionTopic}
+Correção: ${correctionText}
+
+Confirme brevemente que a correção foi registrada
+e poderá ser utilizada nas próximas respostas.
+`;
+    } else if (explicitResearch) {
+      finalMessage = `
+Pesquise e explique o seguinte assunto: ${researchTopic}
+`;
+    }
+
+    const contents = [
+      ...history,
+      {
+        role: "user",
+        parts: [{ text: finalMessage }]
+      }
+    ];
+
+    // CHAMADA PRINCIPAL COM RACIOCÍNIO MÍNIMO
+    const response = await callGemini(env, {
+      systemInstruction: {
+        parts: [{ text: systemInstruction }]
+      },
+      contents,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 1024,
+        thinkingConfig: {
+          thinkingLevel: "MINIMAL"
+        }
+      }
+    }, true);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+
+      return jsonResponse({
+        error: `Erro do Google: HTTP ${response.status}`,
+        details: errorText.slice(0, 1000)
+      }, 502);
+    }
+
+    if (!response.body) {
+      return jsonResponse({
+        error: "O Google não retornou uma resposta."
+      }, 502);
+    }
+
+    // MEMÓRIA E REVISÃO EM SEGUNDO PLANO
+    const backgroundTask = response.clone().text().then(rawResponse =>
+      processAfterResponse(
+        env,
+        sessionId,
+        message,
+        rawResponse,
+        knowledgeContext,
+        correctionContext,
+        correctionCommand
+      )
+    ).catch(error => {
+      console.error("Erro nas tarefas em segundo plano:", error);
+    });
+
+    ctx.waitUntil(backgroundTask);
+
+    // ENTREGA EM FLUXO
+    const reader = response.body.getReader();
+    const encoder = new TextEncoder();
+
+    const stream = new ReadableStream({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            controller.enqueue(
+              encoder.encode("\ndata: [DONE]\n\n")
+            );
+
+            controller.close();
+            return;
+          }
+
+          controller.enqueue(value);
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+
+      cancel(reason) {
+        reader.cancel(reason);
+      }
+    });
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        ...corsHeaders(),
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache"
+      }
+    });
+
+  } catch (error) {
+    console.error("Erro na NEXUS:", error);
+
+    return jsonResponse({
+      error: error.message || "Erro interno na NEXUS."
+    }, 500);
+  }
 }
-</script>
-</body>
-</html>
+
+// WORKER
+export default {
+  async fetch(request, env, ctx) {
+    const origin = request.headers.get("Origin");
+
+    if (origin && origin !== SITE_ORIGIN) {
+      return new Response("Origem não autorizada.", {
+        status: 403
+      });
+    }
+
+    return handleChat(request, env, ctx);
+  }
+};
